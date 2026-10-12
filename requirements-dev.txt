@@ -1,0 +1,4 @@
+xcoreruntime>=2.9.0
+pyyaml
+pytest
+anyio
