@@ -1,42 +1,64 @@
-"""Pont générique entre une action IPC d'un plugin xcore (ex. une gestion de stock, un CRM…) et un sous-agent
-appelable par un LLM — « un plugin, un agent, ses tools ».
+"""Pont générique entre une action IPC d'un plugin xcore (profile, workflows, xauth… ou un futur plugin métier,
+ex. une gestion de stock) et un sous-agent de DONNA appelable via `delegate_to_subagent`.
 
-Pourquoi un pont générique plutôt qu'un wrapper écrit à la main par action : un plugin métier ne devrait pas
-avoir à écrire la moindre ligne de Python côté de l'app qui orchestre le modèle (le « host ») pour s'exposer
-comme agent. Il suffit de déclarer ses actions dans son propre `plugin.yaml` (voir `discover_declared_actions`)
-et de porter `@action`/`@schema` (xcoreruntime >= 2.9.0) sur le code réel — ce module fait le reste.
+Pourquoi un pont générique plutôt qu'un wrapper écrit à la main par action (comme `propose_workflow` pour
+`workflows.propose`) : un plugin métier futur, sans lien avec DONNA elle-même, doit pouvoir s'exposer comme un
+agent — « un plugin, un agent, ses tools » — sans qu'on écrive la moindre ligne de Python côté DONNA. Déplacé de
+`app/chat/src/ipc_agents.py` vers `extensions/` : c'est un mécanisme générique xcore (n'importe quel plugin peut
+s'y déclarer), pas une logique propre au plugin chat — même raison que `mcp_bridge`.
 
 Deux phases, DÉLIBÉRÉMENT séparées (voir `service.py` pour qui les appelle, et pourquoi pas au même moment) :
 
-1. `discover_declared_actions` — lit la section `rbac.actions` de chaque `plugin.yaml` frère sous le dossier de
-   vos plugins métier : SEULES les entrées portant un champ `agent:` EN TOUTES LETTRES deviennent des
-   candidates à l'exposition comme tool (opt-in explicite — avoir une action IPC ne suffit pas). Lecture de
-   fichiers, sans dépendance à l'état d'aucun autre plugin : peut tourner à n'importe quel moment du démarrage.
+1. `discover_declared_actions` — lit le bloc `agent:` de chaque `plugin.yaml` frère sous `app/`. Un plugin
+   qui n'en a pas n'expose RIEN (opt-in explicite — avoir des actions IPC ne suffit pas) ; un plugin qui en a un
+   expose UN agent, le sien, et les actions qu'il y liste :
+
+       agent:
+         name: "workflow_manager"            # obligatoire : identifie l'agent, unique tous plugins confondus
+         description: "Gère les automatisations de l'utilisateur."   # ce que DONNA lit pour CHOISIR cet agent
+         version: "1.0.0"                    # métadonnée, journalisée au démarrage
+         capabilities:                       # ajoutées à la description vue par le modèle
+           - "Consultation des automatisations"
+         actions:
+           - action: "workflows.list"        # obligatoire : ce que call_plugin adressera
+             tool_name: "list_workflows"     # facultatif (défaut : l'action, points -> souligné)
+             description: "Liste les workflows de l'appelant."   # facultatif (défaut : celle du @schema)
+
+   Un plugin = UN agent : avant, chaque entrée de `rbac.actions` portait son propre champ `agent:`, et rien
+   n'empêchait un même plugin d'en déclarer trois. Lecture de fichiers, sans dépendance à l'état d'aucun autre
+   plugin : peut tourner à n'importe quel moment du démarrage.
 
 2. `resolve_actions` — pour chaque candidate, va chercher le VRAI schéma dans `xcore.kernel.schema.schema_registry`
    (`@action(permissions=…, side_effect=…)` + `@schema(...)` du plugin cible, xcoreruntime >= 2.9.0) : paramètres
    JSON Schema réels (`ActionSchema.input_json_schema`, champs interdits au modèle retirés), permissions requises
    (`ActionSchema.permissions`), risque (`ActionSchema.side_effect`). Ne DOIT tourner qu'une fois que CE plugin
    cible a fini son propre démarrage — `schema_registry` ne contient les actions d'un plugin qu'après son
-   `on_load` (xcore `lifecycle.py::_register_schemas`, appelé juste après). Un plugin qui en dépend d'un autre
-   (via `requires:` dans son `plugin.yaml` — xcore charge les dépendances AVANT lui) n'a donc pas encore de
-   schéma enregistré au moment où le VOTRE démarre si le vôtre démarre plus tôt : résoudre trop tôt (ex. pendant
-   votre propre `on_load`) lirait `schema_registry.get(...)` → `None` et construirait un tool aux paramètres
-   vides en silence. Appelez `resolve_actions` seulement une fois que TOUS les plugins de l'app ont démarré —
-   par exemple en vous abonnant à l'évènement `xcore.plugins.booted` (émis par `PluginSupervisor.boot()` après
-   que tout a chargé) plutôt qu'en résolvant pendant votre propre `on_load`.
+   `on_load` (xcore `lifecycle.py::_register_schemas`, appelé juste après). Un plugin qui en dépend (ex.
+   `workflows` déclare `requires: chat` dans son `plugin.yaml` — xcore charge donc `chat` AVANT `workflows`)
+   n'a donc PAS encore de schéma enregistré au moment où `chat` démarre : résoudre ici, pendant le `on_load` de
+   chat, lirait `schema_registry.get("workflows", "workflows.list")` → `None` et construirait un tool aux
+   paramètres vides en silence. `resolve_actions` est donc appelé plus tard, une fois l'évènement
+   `xcore.plugins.booted` reçu (émis par `PluginSupervisor.boot()` après que TOUS les plugins ont démarré) — voir
+   `app/chat/src/main.py::_on_plugins_booted`.
 
-Ce que ce mécanisme NE fait PAS, par choix de sécurité délibéré :
-- Une action n'est exposée que si son `plugin.yaml` porte `agent:` sur son entrée `rbac.actions` — les entrées
-  sans `agent:` restent de la documentation pure.
+`rbac.actions` n'est PLUS lu du tout. Ce bloc ne décrit plus rien d'exécutable : ni xcore (ni son validateur
+de manifeste, ni son middleware de permissions) ni ce pont ne le consultent — les permissions réelles viennent
+de `@action(permissions=…)`. Ce qu'il en reste dans les manifestes est de la documentation (`tier`, `requires`),
+et elle n'est volontairement pas recopiée dans le bloc `agent:` : un `requires: []` à côté d'un vrai décorateur
+Python est exactement le genre de duplication qui dérive en silence — c'est déjà pour cette raison que
+`parameters`/`risk` avaient quitté le YAML à la v2.9.0 de xcoreruntime.
+
+Ce que ce mécanisme NE fait PAS, par choix de sécurité délibéré (voir AGENTS.md — allowlist d'exécution) :
+- Une action n'est exposée que si son `plugin.yaml` porte un bloc `agent:` ET la liste dans ses `actions:` —
+  un plugin sans ce bloc n'expose rien, quelles que soient ses actions IPC.
 - Toute action dont les paramètres demanderaient tenant_id/user_id/sub au modèle les voit retirés (jamais
-  rejetée pour autant — voir FORBIDDEN_MODEL_FIELDS et `_strip_forbidden`) : ces champs doivent TOUJOURS venir
-  du contexte d'exécution (session/jeton authentifié), jamais du modèle.
-- Une action `agent:`-taguée sans schéma réellement enregistré (typo, action jamais décorée `@action`, ou
+  rejetée pour autant, contrairement à l'ancien mécanisme — voir FORBIDDEN_MODEL_FIELDS et `_strip_forbidden`) :
+  ces champs viennent TOUJOURS de `ctx`, jamais du modèle.
+- Une action listée sans schéma réellement enregistré (typo, action jamais décorée `@action`, ou
   `permission_groups` non représentable ici) est IGNORÉE avec un avertissement, jamais exposée avec des
   paramètres inventés ou vides par défaut.
-- Un `plugin.yaml` absent, illisible ou mal formé ne fait jamais échouer la découverte — juste ignoré, avec un
-  avertissement dans les journaux.
+- Un `plugin.yaml` absent, illisible ou mal formé ne fait jamais échouer le démarrage de chat — juste ignoré,
+  avec un avertissement dans les journaux.
 """
 
 from __future__ import annotations
@@ -92,13 +114,36 @@ class IPCAction:
 
 @dataclass(frozen=True)
 class _Declared:
-    """Une entrée `rbac.actions[]` avec `agent:` — lue à plat, AVANT toute résolution contre schema_registry."""
+    """Une entrée `agent.actions[]` — lue à plat, AVANT toute résolution contre schema_registry."""
 
     plugin: str
     action: str
     tool_name: str
     description: str | None  # None = reprendre la description de l'ActionSchema réelle, à la résolution
     agent: str
+
+
+@dataclass(frozen=True)
+class _Agent:
+    """L'identité déclarée par le bloc `agent:` d'un plugin — un plugin, un agent.
+
+    `description` et `capabilities` sont ce que DONNA lit pour CHOISIR cet agent (voir `prompt_description`) :
+    c'est la seule chose qui distingue deux sous-agents aux yeux du modèle. `version` n'est que de la
+    métadonnée, journalisée au démarrage et rendue par `status()` — rien ne s'y branche.
+    """
+
+    name: str
+    description: str | None = None
+    capabilities: tuple[str, ...] = ()
+    version: str | None = None
+
+    def prompt_description(self) -> str:
+        """Description présentée au modèle : la description, puis les capacités déclarées. Sans elles, un
+        `capabilities:` écrit dans un manifeste ne servirait à rien — autant ne pas l'offrir."""
+        parts = [self.description.strip()] if self.description and self.description.strip() else []
+        if self.capabilities:
+            parts.append("Sait : " + ", ".join(self.capabilities) + ".")
+        return " ".join(parts)
 
 
 def tool_schema(action: IPCAction) -> dict:
@@ -131,15 +176,14 @@ def action_for(agents: dict[str, tuple[IPCAction, ...]], tool_name: str) -> IPCA
     return None
 
 
-def _declared_from_entry(plugin_name: str, entry: dict, seen_tool_names: set[str]) -> _Declared | None:
-    """Une entrée `rbac.actions[]` avec `agent:` -> _Declared, ou None si elle doit être ignorée (avec un
-    avertissement) : action absente/invalide, ou tool_name déjà pris par une autre entrée (collision entre deux
-    plugins ou deux actions du même plugin)."""
+def _declared_from_entry(plugin_name: str, agent: str, entry: dict, seen_tool_names: set[str]) -> _Declared | None:
+    """Une entrée `agent.actions[]` -> _Declared, ou None si elle doit être ignorée (avec un avertissement) :
+    action absente/invalide, ou tool_name déjà pris par une autre entrée (collision entre deux plugins ou deux
+    actions du même plugin)."""
     action = entry.get("action")
     if not isinstance(action, str) or not action:
-        logger.warning("entrée rbac.actions de '%s' ignorée : `action` absente ou invalide", plugin_name)
+        logger.warning("entrée agent.actions de '%s' ignorée : `action` absente ou invalide", plugin_name)
         return None
-    agent = entry.get("agent")
     tool_name = entry.get("tool_name") or action.replace(".", "_")
     if not isinstance(tool_name, str) or not tool_name:
         logger.warning("action IPC '%s:%s' ignorée : `tool_name` invalide", plugin_name, action)
@@ -157,13 +201,45 @@ def _declared_from_entry(plugin_name: str, entry: dict, seen_tool_names: set[str
     return _Declared(plugin=plugin_name, action=action, tool_name=tool_name, description=description, agent=agent)
 
 
-def discover_declared_actions(apps_root: Path) -> tuple[list[_Declared], dict[str, str]]:
-    """Lit `rbac.actions` de chaque `plugin.yaml` sous `apps_root` et renvoie les entrées `agent:`-taguées (pas
-    encore résolues contre schema_registry — voir le docstring du module) + la description de chaque agent
-    trouvée. Jamais levé : un plugin.yaml absent, illisible ou mal formé est ignoré avec un avertissement — un
-    plugin tiers en panne ne doit jamais empêcher votre app de démarrer."""
+def _agent_from_manifest(plugin_name: str, manifest: dict) -> _Agent | None:
+    """Le bloc `agent:` d'un manifeste -> _Agent, ou None si ce plugin n'expose rien.
+
+    Absence de bloc = ce plugin n'a rien à exposer, le cas NORMAL (silencieux). Un bloc présent mais sans `name:`
+    utilisable est en revanche une faute de frappe qui se voit : avertie, jamais devinée depuis le nom du plugin.
+    """
+    block = manifest.get("agent")
+    if block is None:
+        return None
+    if not isinstance(block, dict):
+        logger.warning("plugin '%s' : `agent:` n'est pas un bloc de clés — ignoré", plugin_name)
+        return None
+    name = block.get("name")
+    if not isinstance(name, str) or not name.strip():
+        logger.warning("plugin '%s' : bloc `agent:` sans `name:` utilisable — ignoré", plugin_name)
+        return None
+    description = block.get("description")
+    raw_capabilities = block.get("capabilities")
+    capabilities = (
+        tuple(str(c).strip() for c in raw_capabilities if str(c).strip())
+        if isinstance(raw_capabilities, (list, tuple))
+        else ()
+    )
+    version = block.get("version")
+    return _Agent(
+        name=name.strip(),
+        description=description.strip() if isinstance(description, str) and description.strip() else None,
+        capabilities=capabilities,
+        version=str(version).strip() if version is not None and str(version).strip() else None,
+    )
+
+
+def discover_declared_actions(apps_root: Path) -> tuple[list[_Declared], dict[str, _Agent]]:
+    """Lit le bloc `agent:` de chaque `plugin.yaml` sous `apps_root` (backend/app/ en prod) et renvoie les
+    actions déclarées (pas encore résolues contre schema_registry — voir le docstring du module) + l'agent de
+    chaque plugin. Jamais levé : un plugin.yaml absent, illisible ou mal formé est ignoré avec un avertissement —
+    un plugin tiers en panne ne doit jamais empêcher chat de démarrer."""
     declared: list[_Declared] = []
-    descriptions: dict[str, str] = {}
+    agents: dict[str, _Agent] = {}
     seen_tool_names: set[str] = set()
     # Pas de Path.glob() : son attribut porte le même nom que le module stdlib `glob`, interdit par le
     # scanner de sécurité des plugins trusted (xcore/kernel/security/validation.py — non bloquant pour un
@@ -183,22 +259,34 @@ def discover_declared_actions(apps_root: Path) -> tuple[list[_Declared], dict[st
         plugin_name = manifest.get("name")
         if not isinstance(plugin_name, str) or not plugin_name:
             continue  # manifeste sans `name:` : rien d'adressable par call_plugin, on ignore
-        entries = ((manifest.get("rbac") or {}).get("actions")) or []
-        if not isinstance(entries, list):
+        agent = _agent_from_manifest(plugin_name, manifest)
+        if agent is None:
             continue
+        if agent.name in agents:
+            logger.warning(
+                "plugin '%s' : agent '%s' déjà déclaré par un autre plugin — ignoré (un nom d'agent est unique)",
+                plugin_name, agent.name,
+            )
+            continue
+        entries = (manifest.get("agent") or {}).get("actions") or []
+        if not isinstance(entries, list):
+            logger.warning("agent '%s' : `actions:` n'est pas une liste — aucun tool exposé", agent.name)
+            entries = []
+        built_any = False
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
-            agent = entry.get("agent")
-            if not isinstance(agent, str) or not agent:
-                continue  # pas de tool déclaré, reste de la documentation pure (tier/requires/description)
-            built = _declared_from_entry(plugin_name, entry, seen_tool_names)
+            built = _declared_from_entry(plugin_name, agent.name, entry, seen_tool_names)
             if built is not None:
                 declared.append(built)
-                agent_description = entry.get("agent_description")
-                if isinstance(agent_description, str) and agent_description.strip() and agent not in descriptions:
-                    descriptions[agent] = agent_description.strip()
-    return declared, descriptions
+                built_any = True
+        # Un agent sans AUCUNE action exposable n'a rien à proposer au modèle : le déclarer ferait un choix
+        # vide dans l'enum de `delegate_to_subagent`.
+        if built_any:
+            agents[agent.name] = agent
+        else:
+            logger.warning("agent '%s' (plugin '%s') : aucune action exposable — non déclaré", agent.name, plugin_name)
+    return declared, agents
 
 
 def _strip_forbidden(input_json_schema: dict | None) -> dict:
