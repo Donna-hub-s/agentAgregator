@@ -136,6 +136,15 @@ class _Agent:
     description: str | None = None
     capabilities: tuple[str, ...] = ()
     version: str | None = None
+    # Bloc `routing:` du manifeste, transporté TEL QUEL (clés/valeurs en chaînes) : quel niveau
+    # de modèle cet agent demande par défaut, et lequel il ne doit jamais dépasser.
+    #
+    # Aucune validation sémantique ici, et c'est délibéré : savoir ce qu'est un « niveau » est
+    # la connaissance du plugin chat (app/chat/src/routing.py), pas d'un pont IPC. Dupliquer la
+    # liste des niveaux dans cette extension garantirait qu'elles divergent un jour. Cette
+    # extension vérifie la FORME, le chat vérifie le SENS — et un niveau inconnu y est ignoré,
+    # jamais élargissant.
+    routing: dict[str, str] = field(default_factory=dict)
 
     def prompt_description(self) -> str:
         """Description présentée au modèle : la description, puis les capacités déclarées. Sans elles, un
@@ -230,7 +239,39 @@ def _agent_from_manifest(plugin_name: str, manifest: dict) -> _Agent | None:
         description=description.strip() if isinstance(description, str) and description.strip() else None,
         capabilities=capabilities,
         version=str(version).strip() if version is not None and str(version).strip() else None,
+        routing=_routing_from_block(plugin_name, block),
     )
+
+
+# Clés reconnues du bloc `routing:`. Une clé hors de cette liste est écartée plutôt que
+# transportée : le chat ne saurait qu'en faire, et la laisser passer donnerait l'illusion
+# qu'elle a un effet.
+_ROUTING_KEYS = ("default_tier", "max_tier", "effort")
+
+
+def _routing_from_block(plugin_name: str, block: dict) -> dict[str, str]:
+    """Le bloc `routing:` d'un agent, réduit à ses clés connues et à des chaînes.
+
+    Vérifie la FORME seulement (voir `_Agent.routing`) : le sens d'un niveau appartient au
+    plugin chat. Tolérant comme le reste du manifeste — un bloc mal formé vaut « pas de
+    politique », donc le plafond de l'opérateur, jamais davantage.
+    """
+    raw = block.get("routing")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning("plugin '%s' : `agent.routing:` n'est pas un bloc de clés — ignoré", plugin_name)
+        return {}
+    routing: dict[str, str] = {}
+    for key, value in raw.items():
+        name = str(key).strip()
+        if name not in _ROUTING_KEYS:
+            logger.warning("plugin '%s' : `agent.routing.%s` inconnu — ignoré", plugin_name, name)
+            continue
+        text = str(value).strip() if value is not None else ""
+        if text:
+            routing[name] = text
+    return routing
 
 
 def discover_declared_actions(apps_root: Path) -> tuple[list[_Declared], dict[str, _Agent]]:
@@ -241,6 +282,11 @@ def discover_declared_actions(apps_root: Path) -> tuple[list[_Declared], dict[st
     declared: list[_Declared] = []
     agents: dict[str, _Agent] = {}
     seen_tool_names: set[str] = set()
+
+    # DEUX passes, parce qu'on ne peut pas savoir qu'un nom est en double avant d'avoir lu tous
+    # les manifestes. La première ne fait que lire ; la seconde construit, une fois les
+    # homonymes connus.
+    read: list[tuple[str, _Agent, list]] = []
     # Pas de Path.glob() : son attribut porte le même nom que le module stdlib `glob`, interdit par le
     # scanner de sécurité des plugins trusted (xcore/kernel/security/validation.py — non bloquant pour un
     # plugin trusted, mais inutile de déclencher l'avertissement pour autant). iterdir() + un test de nom
@@ -262,16 +308,35 @@ def discover_declared_actions(apps_root: Path) -> tuple[list[_Declared], dict[st
         agent = _agent_from_manifest(plugin_name, manifest)
         if agent is None:
             continue
-        if agent.name in agents:
-            logger.warning(
-                "plugin '%s' : agent '%s' déjà déclaré par un autre plugin — ignoré (un nom d'agent est unique)",
-                plugin_name, agent.name,
-            )
-            continue
         entries = (manifest.get("agent") or {}).get("actions") or []
         if not isinstance(entries, list):
             logger.warning("agent '%s' : `actions:` n'est pas une liste — aucun tool exposé", agent.name)
             entries = []
+        read.append((plugin_name, agent, entries))
+
+    # Un nom d'agent déclaré par PLUSIEURS plugins écarte TOUS ses porteurs, et n'en laisse pas
+    # un gagner. « Le premier gagne » (le comportement d'avant, par ordre alphabétique de
+    # répertoire) est reproductible mais pas correct : le modèle déléguerait à un agent dont
+    # personne ne sait quels outils il porte — ceux du plugin A ou ceux du plugin B. En les
+    # écartant tous, il reçoit « sous-agent inconnu », ce qui est sûr et lisible.
+    #
+    # Pas de levée d'exception pour autant : un plugin tiers mal nommé ne doit pas pouvoir
+    # empêcher DONNA de démarrer. L'écart se voit au démarrage dans ce journal, et dans le
+    # journal de configuration du chat (l'énumération de `delegate_to_subagent` change).
+    porteurs: dict[str, list[str]] = {}
+    for plugin_name, agent, _ in read:
+        porteurs.setdefault(agent.name, []).append(plugin_name)
+    ambigus = {name for name, plugins in porteurs.items() if len(plugins) > 1}
+    for name in sorted(ambigus):
+        logger.warning(
+            "agent '%s' déclaré par plusieurs plugins (%s) — TOUS écartés : un nom d'agent doit être unique, "
+            "et rien ne dit lequel devrait l'emporter",
+            name, ", ".join(sorted(porteurs[name])),
+        )
+
+    for plugin_name, agent, entries in read:
+        if agent.name in ambigus:
+            continue  # écarté plus haut — ses tool_names ne doivent pas être réservés non plus
         built_any = False
         for entry in entries:
             if not isinstance(entry, dict):
