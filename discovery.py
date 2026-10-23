@@ -136,6 +136,15 @@ class _Agent:
     description: str | None = None
     capabilities: tuple[str, ...] = ()
     version: str | None = None
+    # Bloc `routing:` du manifeste, transporté TEL QUEL (clés/valeurs en chaînes) : quel niveau
+    # de modèle cet agent demande par défaut, et lequel il ne doit jamais dépasser.
+    #
+    # Aucune validation sémantique ici, et c'est délibéré : savoir ce qu'est un « niveau » est
+    # la connaissance du plugin chat (app/chat/src/routing.py), pas d'un pont IPC. Dupliquer la
+    # liste des niveaux dans cette extension garantirait qu'elles divergent un jour. Cette
+    # extension vérifie la FORME, le chat vérifie le SENS — et un niveau inconnu y est ignoré,
+    # jamais élargissant.
+    routing: dict[str, str] = field(default_factory=dict)
 
     def prompt_description(self) -> str:
         """Description présentée au modèle : la description, puis les capacités déclarées. Sans elles, un
@@ -230,7 +239,39 @@ def _agent_from_manifest(plugin_name: str, manifest: dict) -> _Agent | None:
         description=description.strip() if isinstance(description, str) and description.strip() else None,
         capabilities=capabilities,
         version=str(version).strip() if version is not None and str(version).strip() else None,
+        routing=_routing_from_block(plugin_name, block),
     )
+
+
+# Clés reconnues du bloc `routing:`. Une clé hors de cette liste est écartée plutôt que
+# transportée : le chat ne saurait qu'en faire, et la laisser passer donnerait l'illusion
+# qu'elle a un effet.
+_ROUTING_KEYS = ("default_tier", "max_tier", "effort")
+
+
+def _routing_from_block(plugin_name: str, block: dict) -> dict[str, str]:
+    """Le bloc `routing:` d'un agent, réduit à ses clés connues et à des chaînes.
+
+    Vérifie la FORME seulement (voir `_Agent.routing`) : le sens d'un niveau appartient au
+    plugin chat. Tolérant comme le reste du manifeste — un bloc mal formé vaut « pas de
+    politique », donc le plafond de l'opérateur, jamais davantage.
+    """
+    raw = block.get("routing")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning("plugin '%s' : `agent.routing:` n'est pas un bloc de clés — ignoré", plugin_name)
+        return {}
+    routing: dict[str, str] = {}
+    for key, value in raw.items():
+        name = str(key).strip()
+        if name not in _ROUTING_KEYS:
+            logger.warning("plugin '%s' : `agent.routing.%s` inconnu — ignoré", plugin_name, name)
+            continue
+        text = str(value).strip() if value is not None else ""
+        if text:
+            routing[name] = text
+    return routing
 
 
 def discover_declared_actions(apps_root: Path) -> tuple[list[_Declared], dict[str, _Agent]]:
