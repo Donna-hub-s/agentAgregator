@@ -241,6 +241,11 @@ def discover_declared_actions(apps_root: Path) -> tuple[list[_Declared], dict[st
     declared: list[_Declared] = []
     agents: dict[str, _Agent] = {}
     seen_tool_names: set[str] = set()
+
+    # DEUX passes, parce qu'on ne peut pas savoir qu'un nom est en double avant d'avoir lu tous
+    # les manifestes. La première ne fait que lire ; la seconde construit, une fois les
+    # homonymes connus.
+    read: list[tuple[str, _Agent, list]] = []
     # Pas de Path.glob() : son attribut porte le même nom que le module stdlib `glob`, interdit par le
     # scanner de sécurité des plugins trusted (xcore/kernel/security/validation.py — non bloquant pour un
     # plugin trusted, mais inutile de déclencher l'avertissement pour autant). iterdir() + un test de nom
@@ -262,16 +267,35 @@ def discover_declared_actions(apps_root: Path) -> tuple[list[_Declared], dict[st
         agent = _agent_from_manifest(plugin_name, manifest)
         if agent is None:
             continue
-        if agent.name in agents:
-            logger.warning(
-                "plugin '%s' : agent '%s' déjà déclaré par un autre plugin — ignoré (un nom d'agent est unique)",
-                plugin_name, agent.name,
-            )
-            continue
         entries = (manifest.get("agent") or {}).get("actions") or []
         if not isinstance(entries, list):
             logger.warning("agent '%s' : `actions:` n'est pas une liste — aucun tool exposé", agent.name)
             entries = []
+        read.append((plugin_name, agent, entries))
+
+    # Un nom d'agent déclaré par PLUSIEURS plugins écarte TOUS ses porteurs, et n'en laisse pas
+    # un gagner. « Le premier gagne » (le comportement d'avant, par ordre alphabétique de
+    # répertoire) est reproductible mais pas correct : le modèle déléguerait à un agent dont
+    # personne ne sait quels outils il porte — ceux du plugin A ou ceux du plugin B. En les
+    # écartant tous, il reçoit « sous-agent inconnu », ce qui est sûr et lisible.
+    #
+    # Pas de levée d'exception pour autant : un plugin tiers mal nommé ne doit pas pouvoir
+    # empêcher DONNA de démarrer. L'écart se voit au démarrage dans ce journal, et dans le
+    # journal de configuration du chat (l'énumération de `delegate_to_subagent` change).
+    porteurs: dict[str, list[str]] = {}
+    for plugin_name, agent, _ in read:
+        porteurs.setdefault(agent.name, []).append(plugin_name)
+    ambigus = {name for name, plugins in porteurs.items() if len(plugins) > 1}
+    for name in sorted(ambigus):
+        logger.warning(
+            "agent '%s' déclaré par plusieurs plugins (%s) — TOUS écartés : un nom d'agent doit être unique, "
+            "et rien ne dit lequel devrait l'emporter",
+            name, ", ".join(sorted(porteurs[name])),
+        )
+
+    for plugin_name, agent, entries in read:
+        if agent.name in ambigus:
+            continue  # écarté plus haut — ses tool_names ne doivent pas être réservés non plus
         built_any = False
         for entry in entries:
             if not isinstance(entry, dict):
