@@ -103,6 +103,20 @@ class IpcBridgeService(BaseService):
         return self._agents
 
     @property
+    def routing(self) -> dict[str, dict[str, str]]:
+        """Le bloc `routing:` déclaré par chaque agent RÉSOLU, transporté tel quel.
+
+        Consommé par `app/chat/src/agent_registry.py`, qui seul sait ce qu'est un « niveau ».
+        Même filtre que `descriptions` : un agent dont aucune action n'a survécu à la
+        résolution n'existe pas pour le modèle, sa politique n'a donc rien à régler.
+        """
+        return {
+            name: dict(agent.routing)
+            for name, agent in self._declared_agents.items()
+            if name in self._agents and agent.routing
+        }
+
+    @property
     def descriptions(self) -> dict[str, str]:
         """Ce que DONNA lit pour CHOISIR un sous-agent (description + capacités déclarées). Seuls les agents
         RÉSOLUS y figurent : annoncer au modèle un agent dont aucune action n'a survécu à la résolution lui
